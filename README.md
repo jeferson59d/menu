@@ -133,6 +133,7 @@ local Cfg = {
 	WallCheck    = false,  -- só mira em quem está visível (toggle "Só Mirar Visível" começa desligado, igual o resto)
 	Hitbox       = 12,
 	TriggerDelay = 0.12,
+	VelocidadeFreecam = 80,
 }
 
 local PADRAO_PEGAR   = { "pegar", "coletar", "pick", "take", "collect", "loot", "grab", "apanhar" }
@@ -287,13 +288,14 @@ end
 --------------------------------------------------------------
 local Hook = genv.JefinHook
 if not Hook then
-	Hook = { Ativo = false, Alvo = nil, Parede = false, Instalado = false }
+	Hook = { Ativo = false, Alvo = nil, Parede = false, ForcarCamera = false, Instalado = false }
 	genv.JefinHook = Hook
 end
 Hook.Mouse = Mouse
 Hook.Ativo = false
 Hook.Alvo = nil
 Hook.Parede = false
+Hook.ForcarCamera = false
 
 local function instalarHooks()
 	if Hook.Instalado then return true end
@@ -302,6 +304,7 @@ local function instalarHooks()
 	local oldIndex, oldNamecall
 
 	local metodosWS  = { Raycast = true, FindPartOnRay = true, FindPartOnRayWithIgnoreList = true, FindPartOnRayWithWhitelist = true }
+	local metodosCam = { ScreenPointToRay = true, ViewportPointToRay = true }
 
 	oldIndex = hookmetamethod(game, "__index", nc(function(self, chave)
 		if (chave == "Hit" or chave == "Target" or chave == "UnitRay")
@@ -319,16 +322,25 @@ local function instalarHooks()
 		return oldIndex(self, chave)
 	end))
 
-	-- nota: o silent aim mira só via Mouse.Hit/Target/UnitRay (hook de __index acima).
-	-- aqui NÃO mexe em raycast de workspace nem de câmera pro silent — isso é o que
-	-- tava quebrando a câmera e o disparo (o jogo também usa esses raycasts pra
-	-- outras coisas, tipo colisão de câmera, e redirecionar tudo pro alvo bagunçava).
-	-- só a bala mágica toca em raycast, e só quando a parede atrapalha, sem mudar a direção.
+	-- nota: o silent aim mira via Mouse.Hit/Target/UnitRay por padrão (hook de __index
+	-- acima) — isso funciona na maioria dos jogos sem arriscar quebrar a câmera.
+	-- "Forçar via Câmera" é opt-in: só mexe em ScreenPointToRay/ViewportPointToRay
+	-- quando esse toggle extra está ligado, pra jogos (tipo o Brisk) que calculam a
+	-- mira direto pela câmera em vez de ler o Mouse. Ligar isso pode voltar a dar o
+	-- bug de câmera saindo do personagem — é a troca consciente que você faz por jogo.
 	oldNamecall = hookmetamethod(game, "__namecall", nc(function(self, ...)
 		local metodo = getnamecallmethod()
-		if Hook.Parede and not checkcaller() and self == workspace and metodosWS[metodo] then
-			local args = table.pack(...)
-			return furarParede(oldNamecall, metodo, args)
+		if not checkcaller() then
+			if self == workspace and metodosWS[metodo] then
+				if Hook.Parede then
+					local args = table.pack(...)
+					return furarParede(oldNamecall, metodo, args)
+				end
+			elseif metodosCam[metodo] and Hook.ForcarCamera and Hook.Ativo and Hook.Alvo
+				and self == workspace.CurrentCamera then
+				local r = oldNamecall(self, ...)
+				return Ray.new(r.Origin, (Hook.Alvo.Position - r.Origin).Unit * r.Direction.Magnitude)
+			end
 		end
 		return oldNamecall(self, ...)
 	end))
@@ -658,6 +670,41 @@ local function restaurarHitbox()
 	end
 end
 
+--------------------------------------------------------------
+--  freecam
+--------------------------------------------------------------
+local freecamPos, freecamYaw, freecamPitch = Vector3.zero, 0, 0
+local freecamAncora = nil
+
+local function freecamIniciar()
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+	local lookVector = cam.CFrame.LookVector
+	freecamPos = cam.CFrame.Position
+	freecamPitch = math.asin(math.clamp(lookVector.Y, -1, 1))
+	freecamYaw = math.atan2(-lookVector.X, -lookVector.Z)
+	cam.CameraType = Enum.CameraType.Scriptable
+	UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+	local r = raiz(LocalPlayer)
+	if r then
+		freecamAncora = r.Anchored
+		r.Anchored = true
+	end
+end
+
+local function freecamParar()
+	local cam = Workspace.CurrentCamera
+	if cam then
+		cam.CameraType = Enum.CameraType.Custom
+		local h = hum(LocalPlayer)
+		if h then cam.CameraSubject = h end
+	end
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	local r = raiz(LocalPlayer)
+	if r and freecamAncora ~= nil then r.Anchored = freecamAncora end
+	freecamAncora = nil
+end
+
 local fbOrig
 local function fbAplicar()
 	Lighting.Brightness = 2
@@ -870,6 +917,33 @@ track(RunService.Stepped:Connect(seguro("noclip", function()
 	if Flags["Noclip"] then passoNoclip() end
 end)))
 
+track(UserInputService.InputChanged:Connect(seguro("freecam_mouse", function(input)
+	if Flags["Freecam"] and input.UserInputType == Enum.UserInputType.MouseMovement then
+		local sens = 0.0028
+		freecamYaw = freecamYaw - input.Delta.X * sens
+		freecamPitch = math.clamp(freecamPitch - input.Delta.Y * sens, -1.5, 1.5)
+	end
+end)))
+
+track(RunService.RenderStepped:Connect(seguro("freecam_passo", function(dt)
+	if not Flags["Freecam"] then return end
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+	local rot = CFrame.Angles(0, freecamYaw, 0) * CFrame.Angles(freecamPitch, 0, 0)
+	local dir = Vector3.zero
+	if not digitando() then
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += rot.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= rot.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += rot.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= rot.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.yAxis end
+	end
+	if dir.Magnitude > 0 then dir = dir.Unit end
+	freecamPos = freecamPos + dir * Cfg.VelocidadeFreecam * dt
+	cam.CFrame = CFrame.new(freecamPos) * rot
+end)))
+
 track(UserInputService.JumpRequest:Connect(seguro("pulo", function()
 	if Flags["Infinite Jump"] then
 		local h = hum(LocalPlayer)
@@ -917,6 +991,17 @@ T_("Bala Mágica", function(on)
 		end
 	end
 	Hook.Parede = on
+end)
+
+T_("Forçar via Câmera", function(on)
+	if on then
+		local ok, res = pcall(instalarHooks)
+		if not ok or not res then
+			toast("forçar via câmera: executor sem hookmetamethod")
+			return false
+		end
+	end
+	Hook.ForcarCamera = on
 end)
 
 T_("Triggerbot", function(on)
@@ -981,6 +1066,11 @@ T_("Fly", function(on)
 end)
 
 T_("Bypass de Queda")
+
+T_("Freecam", function(on)
+	if on then freecamIniciar() else freecamParar() end
+end)
+
 T_("Speed Hack")
 T_("Infinite Jump")
 T_("Bunny Hop")
@@ -1065,6 +1155,10 @@ end
 
 Motor.Botoes["Tamanho da Hitbox"] = function()
 	UI.slider("Tamanho da Hitbox", 4, 30, Cfg.Hitbox, function(v) Cfg.Hitbox = v end)
+end
+
+Motor.Botoes["Velocidade da Freecam"] = function()
+	UI.slider("Velocidade da Freecam", 20, 300, Cfg.VelocidadeFreecam, function(v) Cfg.VelocidadeFreecam = v end)
 end
 
 Motor.Botoes["Parte do Corpo (Aimbot)"] = function()
@@ -1315,6 +1409,7 @@ local function limpar()
 	Hook.Ativo = false
 	Hook.Alvo = nil
 	Hook.Parede = false
+	Hook.ForcarCamera = false
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	for p in pairs(esp) do removerESP(p) end
 	limparItens()
@@ -1338,6 +1433,7 @@ local ABAS = {
 			{ tipo = "toggle", nome = "Aimbot",        desc = "Mira automática no alvo mais próximo" },
 			{ tipo = "toggle", nome = "Silent Aim",    desc = "Acerta sem mover a câmera" },
 			{ tipo = "toggle", nome = "Bala Mágica",   desc = "Disparos atravessam paredes (depende do jogo)" },
+			{ tipo = "toggle", nome = "Forçar via Câmera", desc = "Silent via câmera p/ jogos tipo Brisk — risco de bugar a câmera" },
 			{ tipo = "toggle", nome = "Triggerbot",    desc = "Atira ao cruzar a mira no inimigo" },
 			{ tipo = "toggle", nome = "No Recoil",     desc = "Remove o recuo vertical das armas" },
 			{ tipo = "toggle", nome = "No Spread",     desc = "Agrupa 100% dos disparos" },
@@ -1368,6 +1464,7 @@ local ABAS = {
 			{ tipo = "botao",  nome = "Suavização do Aimbot", desc = "Quão seco ou suave o aimbot trava" },
 			{ tipo = "botao",  nome = "Delay do Triggerbot", desc = "Tempo entre um disparo e outro (ms)" },
 			{ tipo = "botao",  nome = "Tamanho da Hitbox", desc = "Define o tamanho do Hitbox Expander" },
+			{ tipo = "botao",  nome = "Velocidade da Freecam", desc = "Slider de 20 a 300" },
 			{ tipo = "botao",  nome = "Parte do Corpo (Aimbot)", desc = "Onde o aimbot e o silent miram" },
 			{ tipo = "toggle", nome = "Ignorar Time",   desc = "Aimbot/ESP também marcam quem é do seu time" },
 			{ tipo = "toggle", nome = "Só Mirar Visível", desc = "Aimbot ignora quem está atrás de parede" },
@@ -1379,6 +1476,7 @@ local ABAS = {
 		itens = {
 			{ tipo = "toggle", nome = "Fly",            desc = "Voo livre com velocidade ajustável" },
 			{ tipo = "toggle", nome = "Bypass de Queda", desc = "Anula o dano de queda" },
+			{ tipo = "toggle", nome = "Freecam",         desc = "Câmera livre (WASD+mouse), personagem fica parado" },
 			{ tipo = "toggle", nome = "Speed Hack",     desc = "Aumenta a velocidade de caminhada" },
 			{ tipo = "toggle", nome = "Infinite Jump",  desc = "Pulo ilimitado" },
 			{ tipo = "toggle", nome = "Bunny Hop",      desc = "Pulo automático ao pousar" },
@@ -2572,6 +2670,6 @@ end)
 --==============================================================
 --  INÍCIO
 --==============================================================
-UI.gui = gui
+UI.gui = 
 mostrarAba(ABAS[1].nome)
 print("[Jefin Menu] carregado — clique em bind pra configurar os atalhos.")
